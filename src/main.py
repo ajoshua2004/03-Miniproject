@@ -23,6 +23,21 @@ api_note_task = None
 
 # --- Core Functions ---
 
+alpha = 0.2   # smoothing factor
+filtered = 0  # last filtered value
+
+def estimate_lux(raw: int) -> float:
+    """Convert raw ADC reading to an approximate lux value."""
+    if raw == 0:
+        return 0.0
+    RL = (10000 * (65535 - raw)) / raw   # photoresistor resistance (Ω)
+    lux = 500 / (RL / 1000)              # rough lux estimate
+    return lux
+
+def filter_value(new: float, old: float) -> float:
+    """Exponential smoothing filter for stability."""
+    return alpha * new + (1 - alpha) * old
+
 
 def connect_to_wifi(wifi_config: str = "wifi_config.json"):
     """Connects the Pico W to the specified Wi-Fi network.
@@ -167,6 +182,23 @@ async def handle_request(reader, writer):
         stop_tone()  # Force immediate stop
         response = '{"status": "ok", "message": "All sounds stopped."}'
         content_type = "application/json"
+
+    elif method == "GET" and url == "/sensor":  
+        raw = photo_sensor_pin.read_u16()
+        norm = raw / 65535
+        lux = estimate_lux(raw)
+
+        global filtered
+        filtered = filter_value(norm, filtered)
+
+        response = json.dumps({
+            "raw": raw,
+            "norm": round(norm, 4),
+            "lux_est": round(lux, 2),
+            "filtered_norm": round(filtered, 4)
+        })
+        content_type = "application/json"
+
     else:
         writer.write(b"HTTP/1.0 404 Not Found\r\n\r\n")
         await writer.drain()
