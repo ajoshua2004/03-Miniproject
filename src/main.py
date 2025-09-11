@@ -8,24 +8,15 @@ import json
 import asyncio
 
 # --- Pin Configuration ---
-# The photosensor is connected to an Analog-to-Digital Converter (ADC) pin.
-# We will read the voltage, which changes based on light.
-photo_sensor_pin = machine.ADC(26)
-
-# The buzzer is connected to a GPIO pin that supports Pulse Width Modulation (PWM).
-# PWM allows us to create a square wave at a specific frequency to make a sound.
+photo_sensor_pin = machine.ADC(26)   # Use ADC(26) if wired to GP26, change to ADC(28) if using GP28
 buzzer_pin = machine.PWM(machine.Pin(18))
 
 # --- Global State ---
-# This variable will hold the task that plays a note from an API call.
-# This allows us to cancel it if a /stop request comes in.
 api_note_task = None
-
-# --- Core Functions ---
-
 alpha = 0.2   # smoothing factor
 filtered = 0  # last filtered value
 
+# --- Sensor Helpers ---
 def estimate_lux(raw: int) -> float:
     """Convert raw ADC reading to an approximate lux value."""
     if raw == 0:
@@ -38,18 +29,9 @@ def filter_value(new: float, old: float) -> float:
     """Exponential smoothing filter for stability."""
     return alpha * new + (1 - alpha) * old
 
-
+# --- Wi-Fi Setup ---
 def connect_to_wifi(wifi_config: str = "wifi_config.json"):
-    """Connects the Pico W to the specified Wi-Fi network.
-
-    This expects a JSON text file 'wifi_config.json' with 'ssid' and 'password' keys,
-    which would look like
-    {
-        "ssid": "your_wifi_ssid",
-        "password": "your_wifi_password"
-    }
-    """
-
+    """Connects the Pico W to the specified Wi-Fi network."""
     with open(wifi_config, "r") as f:
         data = json.load(f)
 
@@ -58,7 +40,7 @@ def connect_to_wifi(wifi_config: str = "wifi_config.json"):
     wlan.connect(data["ssid"], data["password"])
 
     # Wait for connection or fail
-    max_wait = 10
+    max_wait = 15
     print("Connecting to Wi-Fi...")
     while max_wait > 0:
         if wlan.status() < 0 or wlan.status() >= 3:
@@ -74,7 +56,7 @@ def connect_to_wifi(wifi_config: str = "wifi_config.json"):
         print(f"Connected! Pico IP Address: {ip_address}")
     return ip_address
 
-
+# --- Buzzer Helpers ---
 def play_tone(frequency: int, duration_ms: int) -> None:
     """Plays a tone on the buzzer for a given duration."""
     if frequency > 0:
@@ -85,18 +67,16 @@ def play_tone(frequency: int, duration_ms: int) -> None:
     else:
         time.sleep_ms(duration_ms)  # type: ignore[attr-defined]
 
-
 def stop_tone():
     """Stops any sound from playing."""
-    buzzer_pin.duty_u16(0)  # 0% duty cycle means silence
-
+    buzzer_pin.duty_u16(0)
 
 async def play_api_note(frequency, duration_s):
     """Coroutine to play a note from an API call, can be cancelled."""
     try:
         print(f"API playing note: {frequency}Hz for {duration_s}s")
         buzzer_pin.freq(int(frequency))
-        buzzer_pin.duty_u16(32768)  # 50% duty cycle
+        buzzer_pin.duty_u16(32768)
         await asyncio.sleep(duration_s)
         stop_tone()
         print("API note finished.")
@@ -104,15 +84,13 @@ async def play_api_note(frequency, duration_s):
         stop_tone()
         print("API note cancelled.")
 
-
+# --- Utility ---
 def map_value(x, in_min, in_max, out_min, out_max):
-    """Maps a value from one range to another."""
     return (x - in_min) * (out_max - out_min) // (in_max - in_min) + out_min
 
-
+# --- HTTP Request Handler ---
 async def handle_request(reader, writer):
-    """Handles incoming HTTP requests."""
-    global api_note_task
+    global api_note_task, filtered
 
     print("Client connected")
     request_line = await reader.readline()
@@ -137,7 +115,7 @@ async def handle_request(reader, writer):
     response = ""
     content_type = "text/html"
 
-    # --- API Endpoint Routing ---
+    # Routes
     if method == "GET" and url == "/":
         html = f"""
         <html>
@@ -148,22 +126,17 @@ async def handle_request(reader, writer):
         </html>
         """
         response = html
+
     elif method == "POST" and url == "/play_note":
-        # This requires reading the request body, which is not trivial.
-        # A simple approach for a known content length:
-        # Note: A robust server would parse Content-Length header.
-        # For this student project, we'll assume a small, simple JSON body.
         raw_data = await reader.read(1024)
         try:
             data = json.loads(raw_data)
             freq = data.get("frequency", 0)
             duration = data.get("duration", 0)
 
-            # If a note is already playing via API, cancel it first
             if api_note_task:
                 api_note_task.cancel()
 
-            # Start the new note as a background task
             api_note_task = asyncio.create_task(play_api_note(freq, duration))
 
             response = '{"status": "ok", "message": "Note playing started."}'
@@ -179,16 +152,14 @@ async def handle_request(reader, writer):
         if api_note_task:
             api_note_task.cancel()
             api_note_task = None
-        stop_tone()  # Force immediate stop
+        stop_tone()
         response = '{"status": "ok", "message": "All sounds stopped."}'
         content_type = "application/json"
 
-    elif method == "GET" and url == "/sensor":  
+    elif method == "GET" and url == "/sensor":
         raw = photo_sensor_pin.read_u16()
         norm = raw / 65535
         lux = estimate_lux(raw)
-
-        global filtered
         filtered = filter_value(norm, filtered)
 
         response = json.dumps({
@@ -216,47 +187,34 @@ async def handle_request(reader, writer):
     await writer.wait_closed()
     print("Client disconnected")
 
-
+# --- Main ---
 async def main():
-    """Main execution loop."""
     try:
         ip = connect_to_wifi()
         print(f"Starting web server on {ip}...")
-        asyncio.create_task(asyncio.start_server(handle_request, "0.0.0.0", 80))
+        server = await asyncio.start_server(handle_request, "0.0.0.0", 80)
+        print("Web server started.")
     except Exception as e:
         print(f"Failed to initialize: {e}")
         return
 
-    # This loop runs the "default" behavior: playing sound based on light
+    # Loop for default behavior (sound based on light)
     while True:
-        # Only run this loop if no API note is currently scheduled to play
         if api_note_task is None or api_note_task.done():
-            # Read the sensor. Values range from ~500 (dark) to ~65535 (bright)
             light_value = photo_sensor_pin.read_u16()
-
-            # Map the light value to a frequency range (e.g., C4 to C6)
-            # Adjust the input range based on your room's lighting
-            min_light = 1000
-            max_light = 65000
-            min_freq = 261  # C4
-            max_freq = 1046  # C6
-
-            # Clamp the light value to the expected range
+            min_light, max_light = 1000, 65000
+            min_freq, max_freq = 261, 1046
             clamped_light = max(min_light, min(light_value, max_light))
 
             if clamped_light > min_light:
-                frequency = map_value(
-                    clamped_light, min_light, max_light, min_freq, max_freq
-                )
+                frequency = map_value(clamped_light, min_light, max_light, min_freq, max_freq)
                 buzzer_pin.freq(frequency)
-                buzzer_pin.duty_u16(32768)  # 50% duty cycle
+                buzzer_pin.duty_u16(32768)
             else:
-                stop_tone()  # If it's very dark, be quiet
+                stop_tone()
+        await asyncio.sleep_ms(50)
 
-        await asyncio.sleep_ms(50)  # type: ignore[attr-defined]
-
-
-# Run the main event loop
+# --- Run ---
 if __name__ == "__main__":
     try:
         asyncio.run(main())
