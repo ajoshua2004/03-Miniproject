@@ -6,6 +6,7 @@ import time
 import network
 import json
 import asyncio
+import ubinascii  # Added for MAC address handling
 
 # --- Pin Configuration ---
 # The photosensor is connected to an Analog-to-Digital Converter (ADC) pin.
@@ -21,8 +22,23 @@ buzzer_pin = machine.PWM(machine.Pin(18))
 # This allows us to cancel it if a /stop request comes in.
 api_note_task = None
 
+API_VERSION = "1.0.0"
+alpha = 0.2
+filtered = 0
+
 # --- Core Functions ---
 
+def get_device_id():
+    """Generate unique device_id based on MAC address."""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    mac = wlan.config('mac')
+    mac_str = ubinascii.hexlify(mac).decode('utf-8').upper()
+    return f"pico-w-{mac_str}"
+
+def filter_value(new: float, old: float) -> float:
+    """Exponential smoothing filter for stability."""
+    return alpha * new + (1 - alpha) * old
 
 def connect_to_wifi(wifi_config: str = "wifi_config.json"):
     """Connects the Pico W to the specified Wi-Fi network.
@@ -133,6 +149,33 @@ async def handle_request(reader, writer):
         </html>
         """
         response = html
+        
+    elif method == "GET" and url == "/sensor":
+        # Calculate sensor values
+        raw_value = light_value  # Already read above
+        norm_value = raw_value / 65535.0  # Normalize to 0.0-1.0
+        
+        # Simple lux estimation (this is approximate)
+        # In bright sunlight: ~65000 ADC = ~1000 lux
+        # In office lighting: ~30000 ADC = ~300 lux  
+        # In dim room: ~5000 ADC = ~50 lux
+        lux_est = (norm_value * 1000.0)  # Simple linear mapping
+        
+        response = json.dumps({
+            "raw": raw_value,
+            "norm": round(norm_value, 3),
+            "lux_est": round(lux_est, 1)
+        })
+        content_type = "application/json"
+        
+    elif method == "GET" and url == "/health":
+        response = json.dumps({
+            "status": "ok",
+            "device_id": get_device_id(),
+            "api": API_VERSION
+        })
+        content_type = "application/json"
+        
     elif method == "POST" and url == "/play_note":
         # This requires reading the request body, which is not trivial.
         # A simple approach for a known content length:
