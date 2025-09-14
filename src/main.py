@@ -6,23 +6,39 @@ import time
 import network
 import json
 import asyncio
+import ubinascii  # Added for MAC address handling
 
 # --- Pin Configuration ---
 # The photosensor is connected to an Analog-to-Digital Converter (ADC) pin.
 # We will read the voltage, which changes based on light.
-photo_sensor_pin = machine.ADC(26)
+photo_sensor_pin = machine.ADC(28)
 
 # The buzzer is connected to a GPIO pin that supports Pulse Width Modulation (PWM).
 # PWM allows us to create a square wave at a specific frequency to make a sound.
-buzzer_pin = machine.PWM(machine.Pin(18))
+buzzer_pin = machine.PWM(machine.Pin(16))
 
 # --- Global State ---
 # This variable will hold the task that plays a note from an API call.
 # This allows us to cancel it if a /stop request comes in.
 api_note_task = None
 
+API_VERSION = "1.0.0"
+alpha = 0.2
+filtered = 0
+
 # --- Core Functions ---
 
+def get_device_id():
+    """Generate unique device_id based on MAC address."""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    mac = wlan.config('mac')
+    mac_str = ubinascii.hexlify(mac).decode('utf-8').upper()
+    return f"pico-w-{mac_str}"
+
+def filter_value(new: float, old: float) -> float:
+    """Exponential smoothing filter for stability."""
+    return alpha * new + (1 - alpha) * old
 
 def connect_to_wifi(wifi_config: str = "wifi_config.json"):
     """Connects the Pico W to the specified Wi-Fi network.
@@ -59,6 +75,22 @@ def connect_to_wifi(wifi_config: str = "wifi_config.json"):
         print(f"Connected! Pico IP Address: {ip_address}")
     return ip_address
 
+def map_volume(light_value, min_light=16000, max_light=32000, max_duty_u16=32768):
+    """
+    Map clamped light value (min_light..max_light) to PWM duty cycle (0..32768).
+    """
+    # Clamp input
+    if light_value < min_light:
+        light_value = min_light
+    elif light_value > max_light:
+        light_value = max_light
+    span = max_light - min_light
+    if span <= 0:
+        return 0
+
+    # Invert: min_light -> max duty, max_light -> 0 duty
+    duty = int(((max_light - light_value) / span) * max_duty_u16)
+    return duty
 
 def play_tone(frequency: int, duration_ms: int) -> None:
     """Plays a tone on the buzzer for a given duration."""
@@ -133,6 +165,33 @@ async def handle_request(reader, writer):
         </html>
         """
         response = html
+        
+    elif method == "GET" and url == "/sensor":
+        # Calculate sensor values
+        raw_value = light_value  # Already read above
+        norm_value = raw_value / 65535.0  # Normalize to 0.0-1.0
+        
+        # Simple lux estimation (this is approximate)
+        # In bright sunlight: ~65000 ADC = ~1000 lux
+        # In office lighting: ~30000 ADC = ~300 lux  
+        # In dim room: ~5000 ADC = ~50 lux
+        lux_est = (norm_value * 1000.0)  # Simple linear mapping
+        
+        response = json.dumps({
+            "raw": raw_value,
+            "norm": round(norm_value, 3),
+            "lux_est": round(lux_est, 1)
+        })
+        content_type = "application/json"
+        
+    elif method == "GET" and url == "/health":
+        response = json.dumps({
+            "status": "ok",
+            "device_id": get_device_id(),
+            "api": API_VERSION
+        })
+        content_type = "application/json"
+        
     elif method == "POST" and url == "/play_note":
         # This requires reading the request body, which is not trivial.
         # A simple approach for a known content length:
@@ -186,14 +245,14 @@ async def handle_request(reader, writer):
 
 
 async def main():
-    """Main execution loop."""
-    try:
-        ip = connect_to_wifi()
-        print(f"Starting web server on {ip}...")
-        asyncio.create_task(asyncio.start_server(handle_request, "0.0.0.0", 80))
-    except Exception as e:
-        print(f"Failed to initialize: {e}")
-        return
+#     """Main execution loop."""
+#     try:
+#         ip = connect_to_wifi()
+#         print(f"Starting web server on {ip}...")
+#         asyncio.create_task(asyncio.start_server(handle_request, "0.0.0.0", 80))
+#     except Exception as e:
+#         print(f"Failed to initialize: {e}")
+#         return
 
     # This loop runs the "default" behavior: playing sound based on light
     while True:
@@ -208,16 +267,21 @@ async def main():
             max_light = 65000
             min_freq = 261  # C4
             max_freq = 1046  # C6
-
+            is_dark=40000 #defines the darkness threshold 
             # Clamp the light value to the expected range
             clamped_light = max(min_light, min(light_value, max_light))
-
-            if clamped_light > min_light:
+            
+            if clamped_light<is_dark:
                 frequency = map_value(
                     clamped_light, min_light, max_light, min_freq, max_freq
                 )
-                buzzer_pin.freq(frequency)
-                buzzer_pin.duty_u16(32768)  # 50% duty cycle
+                
+             #   buzzer_pin.freq(clamped_light)
+                buzzer_pin.freq(700)
+                volume=map_volume(clamped_light)
+                print (clamped_light)
+                print(volume)
+                buzzer_pin.duty_u16(volume)  # 50% duty cycle
             else:
                 stop_tone()  # If it's very dark, be quiet
 
