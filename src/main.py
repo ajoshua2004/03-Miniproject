@@ -75,21 +75,54 @@ def connect_to_wifi(wifi_config: str = "wifi_config.json"):
         print(f"Connected! Pico IP Address: {ip_address}")
     return ip_address
 
-def map_volume(light_value, min_light=16000, max_light=32000, max_duty_u16=32768):
+def map_volume(
+    light_value,
+    min_light=16000,
+    max_light=32000,
+    max_duty_u16=32768,
+    louder_when="bright",   # "bright" or "dark"
+    gamma=2.0               # >1 = more change at bright end; <1 = more at dark end
+):
     """
-    Map clamped light value (min_light..max_light) to PWM duty cycle (0..32768).
+    Map (min_light..max_light) -> duty (0..32768) with gamma shaping.
+    louder_when:
+      - "bright": louder as it gets brighter
+      - "dark"  : louder as it gets darker (inverted)
+    gamma:
+      - >1 emphasizes changes at the high end (bright)
+      - <1 emphasizes changes at the low end (dark)
     """
-    # Clamp input
+    # Clamp
     if light_value < min_light:
         light_value = min_light
     elif light_value > max_light:
         light_value = max_light
+
     span = max_light - min_light
     if span <= 0:
         return 0
 
-    # Invert: min_light -> max duty, max_light -> 0 duty
-    duty = int(((max_light - light_value) / span) * max_duty_u16)
+    # Normalize so that 0 = darkest in range, 1 = brightest in range
+    norm = (light_value - min_light) / span         # increases with 'light_value'
+    brightness = 1.0 - norm                         # 0=dark, 1=bright (handles wiring where dark -> higher ADC)
+
+    # Gamma shaping (exponential)
+    if gamma <= 0:
+        gamma = 1.0
+    brightness_shaped = brightness ** gamma
+
+    # Map to duty depending on desired direction
+    if louder_when == "bright":
+        duty = int(brightness_shaped * max_duty_u16)
+    else:  # louder_when == "dark"
+        duty = int((1.0 - brightness_shaped) * max_duty_u16)
+
+    # Safety clamp
+    if duty < 0:
+        duty = 0
+    elif duty > max_duty_u16:
+        duty = max_duty_u16
+
     return duty
 
 def play_tone(frequency: int, duration_ms: int) -> None:
