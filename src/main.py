@@ -1,233 +1,401 @@
 # main.py for Raspberry Pi Pico W
-# Title: Pico Light Orchestra Instrument Code
+# Title: Pico Light Orchestra – Wi-Fi control + smooth light→pitch (transpose+vibrato) + melody queue + /tone
 
 import machine
 import time
 import network
 import json
 import asyncio
+import ubinascii
+import math
 
-# --- Pin Configuration ---
-# The photosensor is connected to an Analog-to-Digital Converter (ADC) pin.
-# We will read the voltage, which changes based on light.
-photo_sensor_pin = machine.ADC(26)
+# --- Hardware ---
+photo_sensor_pin = machine.ADC(28)             # LDR on ADC28
+buzzer_pin = machine.PWM(machine.Pin(16))      # Piezo on GP16 (PWM)
 
-# The buzzer is connected to a GPIO pin that supports Pulse Width Modulation (PWM).
-# PWM allows us to create a square wave at a specific frequency to make a sound.
-buzzer_pin = machine.PWM(machine.Pin(18))
+# --- API / Tasks ---
+API_VERSION = "1.0.0"
+api_note_task = None     # used only for /tone
+# melody queue/task is cooperative via note_queue + melody_player()
 
-# --- Global State ---
-# This variable will hold the task that plays a note from an API call.
-# This allows us to cancel it if a /stop request comes in.
-api_note_task = None
+# ---------- Queue fallback (uasyncio may not have asyncio.Queue) ----------
+def _make_queue():
+    try:
+        _ = asyncio.Queue  # may raise AttributeError on some firmwares
+        return asyncio.Queue()
+    except AttributeError:
+        pass
 
-# --- Core Functions ---
+    class SimpleQueue:
+        def __init__(self):
+            self._items = []
+            self._evt = asyncio.Event()
+            self._evt.set()
 
+        async def put(self, item):
+            self._items.append(item)
+            self._evt.set()
 
-def connect_to_wifi(wifi_config: str = "wifi_config.json"):
-    """Connects the Pico W to the specified Wi-Fi network.
+        async def get(self):
+            while True:
+                if self._items:
+                    return self._items.pop(0)
+                self._evt.clear()
+                await self._evt.wait()
 
-    This expects a JSON text file 'wifi_config.json' with 'ssid' and 'password' keys,
-    which would look like
-    {
-        "ssid": "your_wifi_ssid",
-        "password": "your_wifi_password"
-    }
-    """
+        def get_nowait(self):
+            if not self._items:
+                raise IndexError("queue empty")
+            return self._items.pop(0)
 
-    with open(wifi_config, "r") as f:
-        data = json.load(f)
+    return SimpleQueue()
 
+note_queue = _make_queue()
+stop_now = asyncio.Event()   # aborts current note & gaps when set()
+
+# --- Light calibration (YOUR MEASUREMENTS) ---
+# darkest ~65467, brightest ~1896, and brighter => raw goes DOWN
+LIGHT_INVERT   = True
+LIGHT_MIN_RAW  = 1896     # brightest raw
+LIGHT_MAX_RAW  = 65467    # darkest raw
+LIGHT_GAMMA    = 1.0      # tweak to change response curve (e.g., 0.8 or 1.3)
+
+# --- Smooth pitch control from light (no amplitude gating) ---
+FRAME_MS        = 10      # update pitch every 10 ms (100 Hz control)
+DARK_EDGE       = 33      # % thresholds (used only for /sensor_full info)
+BRIGHT_EDGE     = 67
+
+# Pitch transpose range in semitones (dark -> bright)
+TRANSPOSE_MIN   = -7      # perfect fifth down
+TRANSPOSE_MAX   = +7      # perfect fifth up
+
+# Vibrato (pitch wobble) parameters
+VIBRATO_HZ         = 6.0   # musical vibrato rate
+VIBRATO_DEPTH_MIN  = 0.00  # 0% at darkest
+VIBRATO_DEPTH_MAX  = 0.02  # 2% at brightest (~1/6 semitone) – subtle but clear
+
+# Light smoothing so pitch doesn't jitter
+_norm_prev = None
+NORM_ALPHA = 0.20     # 0..1 (higher = more responsive, lower = smoother)
+
+# ---------- Utilities ----------
+def get_device_id() -> str:
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    wlan.connect(data["ssid"], data["password"])
+    mac = wlan.config("mac")
+    return "pico-w-" + ubinascii.hexlify(mac).decode("utf-8").upper()
 
-    # Wait for connection or fail
-    max_wait = 10
-    print("Connecting to Wi-Fi...")
-    while max_wait > 0:
-        if wlan.status() < 0 or wlan.status() >= 3:
-            break
+def connect_to_wifi(wifi_config: str = "wifi_config.json") -> str:
+    with open(wifi_config, "r") as f:
+        data = json.load(f)
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(data.get("ssid", ""), data.get("password", ""))
+
+    max_wait = 20
+    while max_wait > 0 and not (wlan.status() < 0 or wlan.status() >= 3):
         max_wait -= 1
         time.sleep(1)
-
     if wlan.status() != 3:
         raise RuntimeError("Network connection failed")
+    return wlan.ifconfig()[0]
+
+# ---------- Light normalization ----------
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def read_light_raw(samples: int = 4) -> int:
+    total = 0
+    for _ in range(samples):
+        total += photo_sensor_pin.read_u16()
+        time.sleep_ms(2)
+    return total // samples
+
+def light_raw_to_norm(raw: int) -> float:
+    raw = _clamp(raw, LIGHT_MIN_RAW, LIGHT_MAX_RAW)
+    span = LIGHT_MAX_RAW - LIGHT_MIN_RAW
+    if span <= 0:
+        return 0.0
+    lin = (raw - LIGHT_MIN_RAW) / span  # 0..1 growing with raw
+    if LIGHT_INVERT:
+        lin = 1.0 - lin                  # make it grow with brightness
+    g = LIGHT_GAMMA if LIGHT_GAMMA > 0 else 1.0
+    return lin ** g
+
+def _norm_to_percent(norm: float) -> int:
+    p = int(round(norm * 100))
+    return 0 if p < 0 else 100 if p > 100 else p
+
+def _map(val, a0, a1, b0, b1):
+    # linear map val∈[a0,a1] -> [b0,b1]
+    if a1 == a0:
+        return b0
+    f = (val - a0) / (a1 - a0)
+    if f < 0: f = 0
+    if f > 1: f = 1
+    return b0 + f * (b1 - b0)
+
+def light_to_pitch_params():
+    """
+    Returns:
+      transpose_semitones (float), vibrato_depth (0..~0.02), smoothed_norm (0..1)
+    based on *smoothed* light level.
+    """
+    global _norm_prev
+    raw  = read_light_raw()
+    norm = light_raw_to_norm(raw)  # 0..1
+
+    # exponential smoothing
+    if _norm_prev is None:
+        _norm_prev = norm
     else:
-        status = wlan.ifconfig()
-        ip_address = status[0]
-        print(f"Connected! Pico IP Address: {ip_address}")
-    return ip_address
+        _norm_prev = (NORM_ALPHA * norm) + ((1.0 - NORM_ALPHA) * _norm_prev)
 
+    # map smoothed norm -> semitone transpose & vibrato depth
+    transpose = _map(_norm_prev, 0.0, 1.0, TRANSPOSE_MIN, TRANSPOSE_MAX)
+    vib_depth = _map(_norm_prev, 0.0, 1.0, VIBRATO_DEPTH_MIN, VIBRATO_DEPTH_MAX)
+    return transpose, vib_depth, _norm_prev
 
-def play_tone(frequency: int, duration_ms: int) -> None:
-    """Plays a tone on the buzzer for a given duration."""
-    if frequency > 0:
-        buzzer_pin.freq(int(frequency))
-        buzzer_pin.duty_u16(32768)  # 50% duty cycle
-        time.sleep_ms(duration_ms)  # type: ignore[attr-defined]
-        stop_tone()
-    else:
-        time.sleep_ms(duration_ms)  # type: ignore[attr-defined]
-
-
+# ---------- Buzzer control ----------
 def stop_tone():
-    """Stops any sound from playing."""
-    buzzer_pin.duty_u16(0)  # 0% duty cycle means silence
+    buzzer_pin.duty_u16(0)
 
-
-async def play_api_note(frequency, duration_s):
-    """Coroutine to play a note from an API call, can be cancelled."""
+# ---------- Single-tone player for /tone ----------
+async def play_tone_once(freq: int, ms: int, duty: float):
+    """Play a single tone for ms milliseconds with given duty (0.0..1.0)."""
     try:
-        print(f"API playing note: {frequency}Hz for {duration_s}s")
-        buzzer_pin.freq(int(frequency))
-        buzzer_pin.duty_u16(32768)  # 50% duty cycle
-        await asyncio.sleep(duration_s)
+        if freq > 0 and ms > 0 and duty > 0:
+            buzzer_pin.freq(int(freq))
+            u16 = int(duty * 65535)
+            if u16 < 0: u16 = 0
+            if u16 > 65535: u16 = 65535
+            buzzer_pin.duty_u16(u16)
+            await asyncio.sleep(ms / 1000)
         stop_tone()
-        print("API note finished.")
     except asyncio.CancelledError:
         stop_tone()
-        print("API note cancelled.")
+        raise
 
+# ---------- Melody queue player (pitch-modulated by light) ----------
+async def melody_player():
+    while True:
+        freq, ms, gap_ms = await note_queue.get()
+        if stop_now.is_set():
+            stop_tone()
+            continue
 
-def map_value(x, in_min, in_max, out_min, out_max):
-    """Maps a value from one range to another."""
-    return (x - in_min) * (out_max - out_min) // (in_max - in_min) + out_min
+        if freq > 0 and ms > 0:
+            base_freq = int(freq)
+            remaining = int(ms)
+            t = 0.0
+            while remaining > 0:
+                if stop_now.is_set():
+                    break
+                transpose, vib_depth, _ = light_to_pitch_params()
+                trans_mult = math.pow(2.0, transpose / 12.0)
+                vib = math.sin(2.0 * math.pi * VIBRATO_HZ * t) * vib_depth
 
+                f_now = int(max(1, base_freq * trans_mult * (1.0 + vib)))
+                buzzer_pin.freq(f_now)
+                buzzer_pin.duty_u16(32768)  # steady clean tone
 
+                await asyncio.sleep(FRAME_MS / 1000.0)
+                remaining -= FRAME_MS
+                t += FRAME_MS / 1000.0
+
+            buzzer_pin.duty_u16(0)
+        else:
+            # REST (or invalid)
+            buzzer_pin.duty_u16(0)
+            await asyncio.sleep(max(ms, 0) / 1000)
+
+        if not stop_now.is_set() and gap_ms > 0:
+            await asyncio.sleep(gap_ms / 1000)
+        else:
+            stop_tone()
+
+# ---------- HTTP server ----------
 async def handle_request(reader, writer):
-    """Handles incoming HTTP requests."""
     global api_note_task
 
-    print("Client connected")
-    request_line = await reader.readline()
+    req_line = await reader.readline()
     # Skip headers
     while await reader.readline() != b"\r\n":
         pass
-
     try:
-        request = str(request_line, "utf-8")
-        method, url, _ = request.split()
-        print(f"Request: {method} {url}")
-    except (ValueError, IndexError):
+        method, url, _ = str(req_line, "utf-8").split()
+    except Exception:
         writer.write(b"HTTP/1.0 400 Bad Request\r\n\r\n")
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-        return
+        await writer.drain(); writer.close(); await writer.wait_closed(); return
 
-    # Read current sensor value
-    light_value = photo_sensor_pin.read_u16()
-
-    response = ""
-    content_type = "text/html"
-
-    # --- API Endpoint Routing ---
+    # ---- Routes ----
+    # Home
     if method == "GET" and url == "/":
-        html = f"""
-        <html>
-            <body>
-                <h1>Pico Light Orchestra</h1>
-                <p>Current light sensor reading: {light_value}</p>
-            </body>
-        </html>
-        """
-        response = html
-    elif method == "POST" and url == "/play_note":
-        # This requires reading the request body, which is not trivial.
-        # A simple approach for a known content length:
-        # Note: A robust server would parse Content-Length header.
-        # For this student project, we'll assume a small, simple JSON body.
-        raw_data = await reader.read(1024)
+        raw = read_light_raw()
+        norm = light_raw_to_norm(raw)
+        body = (
+            "<html><body><h1>Pico Light Orchestra</h1>"
+            f"<p>Light raw: {raw}</p>"
+            f"<p>Light norm: {norm:.2f}</p>"
+            "</body></html>"
+        )
+        response = body
+        content_type = "text/html"
+        status_line = "HTTP/1.0 200 OK\r\n"
+
+    # Basic sensor
+    elif method == "GET" and url == "/sensor":
+        raw = read_light_raw()
+        norm = light_raw_to_norm(raw)
+        lux_est = norm * 200.0  # simple scaled number
+
+        response = (
+            '{\n'
+            '  "raw": ' + str(raw) + ',\n'
+            '  "norm": ' + ('%.2f' % norm) + ',\n'
+            '  "lux_est": ' + ('%.1f' % lux_est) + '\n'
+            '}'
+        )
+        content_type = "application/json"
+        status_line = "HTTP/1.0 200 OK\r\n"
+
+    # Health
+    elif method == "GET" and url == "/health":
+        response = (
+            '{\n'
+            '  "status":"ok",\n'
+            '  "device_id":"' + get_device_id() + '",\n'
+            '  "api":"' + API_VERSION + '"'
+            '\n}'
+        )
+        content_type = "application/json"
+        status_line = "HTTP/1.0 200 OK\r\n"
+
+
+    # NEW: Plays a single tone immediately; cancels any tone/melody
+    # Request: {"freq": 440, "ms": 300, "duty": 0.5}
+    # Response: 202 Accepted {"playing": true, "until_ms_from_now": 300}
+    elif method == "POST" and url == "/tone":
+        raw_data = await reader.read(4096)
         try:
             data = json.loads(raw_data)
-            freq = data.get("frequency", 0)
-            duration = data.get("duration", 0)
+            freq = int(data.get("freq", 0))
+            ms   = int(data.get("ms", 0))
+            duty = float(data.get("duty", 0.5))
+            # clamp duty
+            if duty < 0.0: duty = 0.0
+            if duty > 1.0: duty = 1.0
 
-            # If a note is already playing via API, cancel it first
+            # cancel any running single-tone task
             if api_note_task:
                 api_note_task.cancel()
+                try: await api_note_task
+                except Exception: pass
+                api_note_task = None
 
-            # Start the new note as a background task
-            api_note_task = asyncio.create_task(play_api_note(freq, duration))
+            # cancel any queued melody playback
+            stop_now.set()
+            cleared = 0
+            try:
+                while True:
+                    _ = note_queue.get_nowait()
+                    cleared += 1
+            except Exception:
+                pass
 
-            response = '{"status": "ok", "message": "Note playing started."}'
+            # schedule new tone
+            api_note_task = asyncio.create_task(play_tone_once(freq, ms, duty))
+
+            response = json.dumps({
+                "playing": True if (freq > 0 and ms > 0 and duty > 0) else False,
+                "until_ms_from_now": ms
+            })
             content_type = "application/json"
-        except (ValueError, json.JSONDecodeError):
-            writer.write(b'HTTP/1.0 400 Bad Request\r\n\r\n{"error": "Invalid JSON"}\r\n')
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            return
+            status_line = "HTTP/1.0 202 Accepted\r\n"
 
+        except Exception:
+            writer.write(b'HTTP/1.0 400 Bad Request\r\n\r\n{"error":"Invalid JSON"}\r\n')
+            await writer.drain(); writer.close(); await writer.wait_closed(); return
+
+    # Melody queue (light-modulated pitch)
+    # Request: {"notes":[{"freq":523,"ms":200}, ...], "gap_ms":20}
+    elif method == "POST" and url == "/melody":
+        raw_data = await reader.read(65536)
+        try:
+            data = json.loads(raw_data)
+            notes = data.get("notes", [])
+            gap_ms = int(data.get("gap_ms", 50))
+
+            count = 0
+            for n in notes:
+                if isinstance(n, dict):
+                    freq = int(n.get("freq", 0))
+                    ms   = int(n.get("ms", 0))
+                    if ms > 0:
+                        await note_queue.put((freq, ms, gap_ms))
+                        count += 1
+
+            # allow playback if previously stopped
+            if stop_now.is_set():
+                stop_now.clear()
+
+            response = '{\n  "queued": %d\n}' % count  # pretty for MicroPython
+            content_type = "application/json"
+            status_line = "HTTP/1.0 200 OK\r\n"
+        except Exception:
+            writer.write(b'HTTP/1.0 400 Bad Request\r\n\r\n{"error":"Invalid melody JSON"}\r\n')
+            await writer.drain(); writer.close(); await writer.wait_closed(); return
+
+    # Stop everything (tone + melody)
     elif method == "POST" and url == "/stop":
         if api_note_task:
             api_note_task.cancel()
+            try: await api_note_task
+            except Exception: pass
             api_note_task = None
-        stop_tone()  # Force immediate stop
-        response = '{"status": "ok", "message": "All sounds stopped."}'
+
+        stop_now.set()
+        cleared = 0
+        try:
+            while True:
+                _ = note_queue.get_nowait()
+                cleared += 1
+        except Exception:
+            pass
+
+        stop_tone()
+        response = json.dumps({"status": "ok", "message": "Stopped.", "cleared": cleared})
         content_type = "application/json"
+        status_line = "HTTP/1.0 200 OK\r\n"
+
     else:
         writer.write(b"HTTP/1.0 404 Not Found\r\n\r\n")
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-        return
+        await writer.drain(); writer.close(); await writer.wait_closed(); return
 
     # Send response
-    writer.write(
-        f"HTTP/1.0 200 OK\r\nContent-type: {content_type}\r\n\r\n".encode("utf-8")
-    )
+    writer.write(f"{status_line}Content-type: {content_type}\r\n\r\n".encode("utf-8"))
     writer.write(response.encode("utf-8"))
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
-    print("Client disconnected")
+    await writer.drain(); writer.close(); await writer.wait_closed()
 
-
+# ---------- Main ----------
 async def main():
-    """Main execution loop."""
     try:
         ip = connect_to_wifi()
-        print(f"Starting web server on {ip}...")
-        asyncio.create_task(asyncio.start_server(handle_request, "0.0.0.0", 80))
+        print("Connected on", ip)
+        _ = await asyncio.start_server(handle_request, "0.0.0.0", 80)
+        print("HTTP server listening on http://%s/" % ip)
+
+        _ = asyncio.create_task(melody_player())
+        while True:
+            await asyncio.sleep(1)
     except Exception as e:
-        print(f"Failed to initialize: {e}")
-        return
+        print("Init failed:", e)
+        stop_tone()
 
-    # This loop runs the "default" behavior: playing sound based on light
-    while True:
-        # Only run this loop if no API note is currently scheduled to play
-        if api_note_task is None or api_note_task.done():
-            # Read the sensor. Values range from ~500 (dark) to ~65535 (bright)
-            light_value = photo_sensor_pin.read_u16()
-
-            # Map the light value to a frequency range (e.g., C4 to C6)
-            # Adjust the input range based on your room's lighting
-            min_light = 1000
-            max_light = 65000
-            min_freq = 261  # C4
-            max_freq = 1046  # C6
-
-            # Clamp the light value to the expected range
-            clamped_light = max(min_light, min(light_value, max_light))
-
-            if clamped_light > min_light:
-                frequency = map_value(
-                    clamped_light, min_light, max_light, min_freq, max_freq
-                )
-                buzzer_pin.freq(frequency)
-                buzzer_pin.duty_u16(32768)  # 50% duty cycle
-            else:
-                stop_tone()  # If it's very dark, be quiet
-
-        await asyncio.sleep_ms(50)  # type: ignore[attr-defined]
-
-
-# Run the main event loop
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Program stopped.")
         stop_tone()
+        print("Program stopped.")
+
