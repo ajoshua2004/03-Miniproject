@@ -1,4 +1,10 @@
-# dashboard.py — single-Pico, lean version
+#
+# New dashboard, we wanted our own instead of using the one originally provided.
+# Purpose: This is to be run locally on the computer which must be on the same network as the Pico
+# Usage: python dashboard_new.py
+# Note: Ensure the IP address of the PICO below is correct.
+#
+
 import requests 
 import time
 import sys
@@ -90,7 +96,7 @@ def poll_once(state: DeviceState):
     except requests.exceptions.RequestException as e:
         state.last_error = f"sensor:{type(e).__name__}"
 
-    # playback
+    # playback or notes queued
     try:
         r, _ = timed_get(f"{base}/playback", HTTP_TIMEOUT)
         if r.status_code == 200:
