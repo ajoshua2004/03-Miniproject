@@ -5,7 +5,7 @@ import sys
 from datetime import datetime, timedelta, UTC
 
 # --- Config and Formatting Constants ---
-PICO_IP = "172.20.10.8"
+PICO_IP = "172.20.10.8"    # 
 POLL_INTERVAL = 1.0        # s
 HTTP_TIMEOUT = 1.0         # s
 LATENCY_WARN_MS = 150
@@ -42,7 +42,7 @@ class DeviceState:
         self.latency_ms = None
         self.last_error = None
         self.last_seen = None
-        # playback (optional)
+        # playback
         self.playing = None
         self.play_until = None  # datetime or None
         self.queue_len = None
@@ -173,7 +173,6 @@ def CLI_db_print(state: DeviceState):
         for a in alerts:
             print(color(" - " + a, YELLOW if "latency" in a or "degraded" in a else RED))
 
-# --- Main ---
 if __name__ == "__main__":
     try:
         if not PICO_IP:
